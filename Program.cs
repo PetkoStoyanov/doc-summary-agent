@@ -10,12 +10,15 @@ using Microsoft.Agents.AI;
 using ModelContextProtocol.Client;
 using UglyToad.PdfPig;
 
-const string defaultEndpoint = "https://pocs-agents-petkosto-resource.services.ai.azure.com/api/projects/pocs-agents-petkosto";
-const string defaultDeployment = "gpt-5.4-mini";
+var envFilePath = Path.Combine(Directory.GetCurrentDirectory(), ".env");
+if (File.Exists(envFilePath))
+{
+	DotNetEnv.Env.NoClobber().Load(envFilePath);
+}
 
 if (args.Length == 0 || args[0] is "--help" or "-h")
 {
-	Console.WriteLine("Usage: DocSummaryAgent <document-path> [--workiq] [--copy-to-onedrive]");
+	Console.WriteLine("Usage: DocSummaryAgent <document-path> [--workiq] [--copy-to-onedrive] [--send-email] [--send-teams]");
 	return;
 }
 
@@ -33,13 +36,17 @@ if (sources.Count == 0)
 	return;
 }
 
-var endpoint = Environment.GetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_ENDPOINT") ?? defaultEndpoint;
-var deployment = Environment.GetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME") ?? defaultDeployment;
 var tools = new List<Microsoft.Extensions.AI.AITool>();
 McpClient? workIqClient = null;
 
 try
 {
+	var endpoint = GetRequiredSetting("AZURE_FOUNDRY_PROJECT_ENDPOINT");
+	var deployment = GetRequiredSetting("AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME");
+	Console.Error.WriteLine("Attempting Azure authentication using DefaultAzureCredential...");
+	LogAzureAuthDiagnostics();
+	var credential = CreateAzureCredential();
+
 	if (args.Contains("--workiq", StringComparer.OrdinalIgnoreCase))
 	{
 		workIqClient = await McpClient.CreateAsync(new StdioClientTransport(new()
@@ -56,7 +63,7 @@ try
 		Console.WriteLine($"Work IQ connected: {tools.Count} read-only tools available.");
 	}
 
-	var agent = new AIProjectClient(new Uri(endpoint), new DefaultAzureCredential())
+	var agent = new AIProjectClient(new Uri(endpoint), credential)
 		.AsAIAgent(
 			model: deployment,
 			name: "DocSummaryAgent",
@@ -83,15 +90,17 @@ try
 	Console.WriteLine($"\nDocument: {Path.GetFileName(filePath)}\n");
 	Console.WriteLine(answer);
 
-	if (args.Contains("--copy-to-onedrive", StringComparer.OrdinalIgnoreCase))
+	var copyToOneDrive = args.Contains("--copy-to-onedrive", StringComparer.OrdinalIgnoreCase);
+	var sendEmail = args.Contains("--send-email", StringComparer.OrdinalIgnoreCase);
+	var sendTeams = args.Contains("--send-teams", StringComparer.OrdinalIgnoreCase);
+	DeviceCodeCredential? graphCredential = null;
+	if (copyToOneDrive || sendEmail || sendTeams)
 	{
-		var tenantId = Environment.GetEnvironmentVariable("AZURE_TENANT_ID");
-		var clientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
-		if (string.IsNullOrWhiteSpace(tenantId) || string.IsNullOrWhiteSpace(clientId))
-		{
-			throw new InvalidOperationException("Set AZURE_TENANT_ID and AZURE_CLIENT_ID for a public-client app registration with delegated Microsoft Graph Files.ReadWrite permission.");
-		}
+		graphCredential = CreateGraphCredential();
+	}
 
+	if (copyToOneDrive)
+	{
 		Console.Write("OneDrive destination folder (blank for root): ");
 		var folder = Console.ReadLine()?.Trim().Trim('/');
 		if (folder is null || folder.Split('/').Any(segment => segment is "." or ".."))
@@ -112,12 +121,33 @@ try
 			return;
 		}
 
-		await UploadToOneDriveAsync(filePath, destination, tenantId, clientId);
+		await UploadToOneDriveAsync(filePath, destination, graphCredential!);
 	}
+
+	if (sendEmail)
+	{
+		await PrepareAndSendEmailAsync(Path.GetFileName(filePath), answer, graphCredential!);
+	}
+
+	if (sendTeams)
+	{
+		await PrepareAndSendTeamsMessageAsync(Path.GetFileName(filePath), answer, graphCredential!);
+	}
+}
+catch (AuthenticationFailedException exception)
+{
+	Console.Error.WriteLine("Azure authentication failed.");
+	LogAzureAuthDiagnostics();
+	DumpException(exception);
+	Console.Error.WriteLine("Sign in with Azure CLI first: az login");
+	Console.Error.WriteLine("If your tenant is not the default one, use: az login --tenant <tenant-id>");
+	Environment.ExitCode = 1;
 }
 catch (Exception exception)
 {
-	Console.Error.WriteLine($"Operation failed: {exception.Message}");
+	Console.Error.WriteLine("Operation failed.");
+	LogAzureAuthDiagnostics();
+	DumpException(exception);
 	Environment.ExitCode = 1;
 }
 finally
@@ -125,6 +155,49 @@ finally
 	if (workIqClient is not null)
 	{
 		await workIqClient.DisposeAsync();
+	}
+}
+
+static void LogAzureAuthDiagnostics()
+{
+	var endpoint = Environment.GetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_ENDPOINT");
+	var deployment = Environment.GetEnvironmentVariable("AZURE_FOUNDRY_PROJECT_DEPLOYMENT_NAME");
+	var tenant = Environment.GetEnvironmentVariable("AZURE_TENANT_ID");
+	var clientId = Environment.GetEnvironmentVariable("AZURE_CLIENT_ID");
+	var subscriptionId = Environment.GetEnvironmentVariable("AZURE_SUBSCRIPTION_ID");
+
+	Console.Error.WriteLine("=== Azure auth diagnostics ===");
+	Console.Error.WriteLine($"Current directory: {Directory.GetCurrentDirectory()}");
+	Console.Error.WriteLine($"Endpoint configured: {!string.IsNullOrWhiteSpace(endpoint)}");
+	Console.Error.WriteLine($"Deployment configured: {!string.IsNullOrWhiteSpace(deployment)}");
+	Console.Error.WriteLine($"Tenant configured: {!string.IsNullOrWhiteSpace(tenant)}");
+	Console.Error.WriteLine($"Client ID configured: {!string.IsNullOrWhiteSpace(clientId)}");
+	Console.Error.WriteLine($"Subscription configured: {!string.IsNullOrWhiteSpace(subscriptionId)}");
+	if (!string.IsNullOrWhiteSpace(endpoint)) Console.Error.WriteLine($"Endpoint: {endpoint}");
+	if (!string.IsNullOrWhiteSpace(deployment)) Console.Error.WriteLine($"Deployment: {deployment}");
+	if (!string.IsNullOrWhiteSpace(tenant)) Console.Error.WriteLine($"Tenant: {tenant}");
+	if (!string.IsNullOrWhiteSpace(clientId)) Console.Error.WriteLine($"Client ID: {clientId}");
+	if (!string.IsNullOrWhiteSpace(subscriptionId)) Console.Error.WriteLine($"Subscription: {subscriptionId}");
+	Console.Error.WriteLine("Credential chain: EnvironmentCredential -> ManagedIdentityCredential -> AzureCliCredential -> VisualStudioCodeCredential -> others");
+	Console.Error.WriteLine("==============================");
+}
+
+static void DumpException(Exception exception)
+{
+	var current = exception;
+	var depth = 0;
+	while (current is not null)
+	{
+		Console.Error.WriteLine($"Exception[{depth}]: {current.GetType().Name}: {current.Message}");
+		if (current is AggregateException aggregate)
+		{
+			foreach (var inner in aggregate.InnerExceptions)
+			{
+				Console.Error.WriteLine($"  Inner: {inner.GetType().Name}: {inner.Message}");
+			}
+		}
+		current = current.InnerException;
+		depth++;
 	}
 }
 
@@ -140,21 +213,163 @@ static bool IsReadOnlyWorkIqTool(string name)
 		|| normalized.EndsWith("callfunction", StringComparison.Ordinal);
 }
 
-static async Task UploadToOneDriveAsync(string filePath, string destination, string tenantId, string clientId)
+static TokenCredential CreateAzureCredential()
 {
-	const int chunkSize = 10 * 1024 * 1024;
-	var options = new DeviceCodeCredentialOptions
+	var tenantId = Environment.GetEnvironmentVariable("AZURE_TENANT_ID");
+	var options = new DefaultAzureCredentialOptions
 	{
-		TenantId = tenantId,
-		ClientId = clientId,
+		ExcludeVisualStudioCredential = true,
+		ExcludeAzurePowerShellCredential = true,
+		ExcludeInteractiveBrowserCredential = true
+	};
+
+	if (!string.IsNullOrWhiteSpace(tenantId))
+	{
+		options.TenantId = tenantId;
+		options.VisualStudioTenantId = tenantId;
+		options.SharedTokenCacheTenantId = tenantId;
+	}
+
+	return new DefaultAzureCredential(options);
+}
+
+static string GetRequiredSetting(string name)
+{
+	var value = Environment.GetEnvironmentVariable(name);
+	if (string.IsNullOrWhiteSpace(value))
+	{
+		throw new InvalidOperationException($"Missing required setting '{name}'. Set it in .env or the process environment.");
+	}
+
+	return value;
+}
+
+static DeviceCodeCredential CreateGraphCredential()
+{
+	return new DeviceCodeCredential(new DeviceCodeCredentialOptions
+	{
+		TenantId = GetRequiredSetting("AZURE_TENANT_ID"),
+		ClientId = GetRequiredSetting("AZURE_CLIENT_ID"),
 		DeviceCodeCallback = (code, _) =>
 		{
 			Console.WriteLine(code.Message);
 			return Task.CompletedTask;
 		}
+	});
+}
+
+static async Task PrepareAndSendEmailAsync(string fileName, string summary, TokenCredential credential)
+{
+	Console.Write("Email recipient address: ");
+	var recipient = Console.ReadLine()?.Trim();
+	if (string.IsNullOrWhiteSpace(recipient) || !string.Equals(new System.Net.Mail.MailAddress(recipient).Address, recipient, StringComparison.OrdinalIgnoreCase))
+	{
+		throw new InvalidOperationException("Enter one valid email address.");
+	}
+
+	Console.Write($"Email subject [Document summary: {fileName}]: ");
+	var subject = Console.ReadLine()?.Trim();
+	if (string.IsNullOrWhiteSpace(subject))
+	{
+		subject = $"Document summary: {fileName}";
+	}
+
+	Console.WriteLine($"\nEmail recipient: {recipient}\nSubject: {subject}\n\n{summary}");
+	Console.Write("Send this email? [y/N]: ");
+	if (!IsConfirmed())
+	{
+		Console.WriteLine("Email canceled.");
+		return;
+	}
+
+	var payload = new
+	{
+		message = new
+		{
+			subject,
+			body = new { contentType = "Text", content = summary },
+			toRecipients = new[] { new { emailAddress = new { address = recipient } } }
+		}
 	};
-	var credential = new DeviceCodeCredential(options);
-	var token = await credential.GetTokenAsync(new TokenRequestContext(["Files.ReadWrite"]));
+	await SendGraphMessageAsync("https://graph.microsoft.com/v1.0/me/sendMail", "https://graph.microsoft.com/Mail.Send", payload, credential, "Email");
+}
+
+static async Task PrepareAndSendTeamsMessageAsync(string fileName, string summary, TokenCredential credential)
+{
+	Console.Write("Teams destination [1: existing chat, 2: channel]: ");
+	var destinationType = Console.ReadLine()?.Trim();
+	string path;
+	string target;
+	string scope;
+	if (destinationType == "1")
+	{
+		Console.Write("Existing Teams chat ID: ");
+		var chatId = Console.ReadLine()?.Trim();
+		if (string.IsNullOrWhiteSpace(chatId))
+		{
+			throw new InvalidOperationException("A Teams chat ID is required.");
+		}
+
+		target = $"Chat ID: {chatId}";
+		path = $"chats/{Uri.EscapeDataString(chatId)}/messages";
+		scope = "https://graph.microsoft.com/ChatMessage.Send";
+	}
+	else if (destinationType == "2")
+	{
+		Console.Write("Teams team ID: ");
+		var teamId = Console.ReadLine()?.Trim();
+		Console.Write("Teams channel ID: ");
+		var channelId = Console.ReadLine()?.Trim();
+		if (string.IsNullOrWhiteSpace(teamId) || string.IsNullOrWhiteSpace(channelId))
+		{
+			throw new InvalidOperationException("Both a Teams team ID and channel ID are required.");
+		}
+
+		target = $"Team ID: {teamId}\nChannel ID: {channelId}";
+		path = $"teams/{Uri.EscapeDataString(teamId)}/channels/{Uri.EscapeDataString(channelId)}/messages";
+		scope = "https://graph.microsoft.com/ChannelMessage.Send";
+	}
+	else
+	{
+		throw new InvalidOperationException("Choose 1 for an existing chat or 2 for a channel.");
+	}
+
+	var message = $"Document summary: {fileName}\n\n{summary}";
+	Console.WriteLine($"\nTeams destination:\n{target}\n\n{message}");
+	Console.Write("Send this Teams message? [y/N]: ");
+	if (!IsConfirmed())
+	{
+		Console.WriteLine("Teams message canceled.");
+		return;
+	}
+
+	var payload = new { body = new { contentType = "text", content = message } };
+	await SendGraphMessageAsync($"https://graph.microsoft.com/v1.0/{path}", scope, payload, credential, "Teams message");
+}
+
+static bool IsConfirmed() => string.Equals(Console.ReadLine()?.Trim(), "y", StringComparison.OrdinalIgnoreCase);
+
+static async Task SendGraphMessageAsync(string requestUri, string scope, object payload, TokenCredential credential, string actionName)
+{
+	var token = await credential.GetTokenAsync(new TokenRequestContext([scope]), CancellationToken.None);
+	using var client = new HttpClient();
+	using var request = new HttpRequestMessage(HttpMethod.Post, requestUri);
+	request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
+	request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+	using var response = await client.SendAsync(request);
+	if (!response.IsSuccessStatusCode)
+	{
+		var details = await response.Content.ReadAsStringAsync();
+		throw new InvalidOperationException($"{actionName} failed ({(int)response.StatusCode}): {details}");
+	}
+
+	Console.WriteLine($"{actionName} accepted by Microsoft Graph.");
+}
+
+static async Task UploadToOneDriveAsync(string filePath, string destination, TokenCredential credential)
+{
+	const int chunkSize = 10 * 1024 * 1024;
+	var token = await credential.GetTokenAsync(new TokenRequestContext(["https://graph.microsoft.com/Files.ReadWrite"]), CancellationToken.None);
 	var sessionUri = new Uri($"https://graph.microsoft.com/v1.0/me/drive/root:/{destination}:/createUploadSession");
 	var payload = JsonSerializer.Serialize(new
 	{

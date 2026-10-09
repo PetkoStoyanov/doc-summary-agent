@@ -16,6 +16,13 @@ This is a local .NET 10 C# console application using Microsoft Agent Framework (
 - Azure resource group: `rg-pocs-agents-petkosto`
 - Authenticate locally with Azure CLI credentials; do not put credentials in source files.
 
+## Environment Files
+
+- Copy `.env.example` to `.env` for local settings. `.env` is ignored by Git.
+- Process environment variables take precedence over values from `.env`.
+- Foundry project endpoint and deployment name are required settings.
+- `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` are required only when using `--copy-to-onedrive`, `--send-email`, or `--send-teams`.
+
 ## Work IQ Safety
 
 - Work IQ is started on demand with `npx -y @microsoft/workiq mcp`.
@@ -24,11 +31,31 @@ This is a local .NET 10 C# console application using Microsoft Agent Framework (
 - Keep write tools unavailable to the model. Copy, email, and Teams operations must show the exact target and content and receive per-action confirmation before execution.
 - Work IQ preview file upload is not available. Use an explicitly authorized Microsoft Graph upload path for local files if implemented.
 
+## OneDrive Copy
+
+- Copying is opt-in with `--copy-to-onedrive` and requires a separate explicit `y` confirmation after showing the full source and OneDrive destination.
+- Configure `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` for a public-client app registration with delegated Microsoft Graph `Files.ReadWrite` permission and device-code flow enabled.
+- Uploads use Microsoft Graph upload sessions with conflict behavior `fail`; existing files are not overwritten. Upload is chunked in 10 MiB ranges.
+- No OneDrive sign-in or upload has been exercised in this environment; tenant consent and app registration configuration are still required.
+
+## Email and Teams
+
+- `--send-email` previews the recipient, subject, and exact text body, then requires a separate explicit `y` confirmation before sending through Microsoft Graph.
+- `--send-teams` requires an existing chat ID or a team and channel ID, previews the target and exact message, then requires a separate explicit `y` confirmation.
+- Configure only the delegated Graph permissions needed: `Mail.Send`, `ChatMessage.Send`, and/or `ChannelMessage.Send`, in addition to `Files.ReadWrite` if using OneDrive.
+- Sending is performed by application code after confirmation; write tools are not exposed to the model.
+- No email or Teams send has been exercised in this environment; tenant consent and app registration configuration are still required.
+
 ## Current Implementation Status
 
-- `Program.cs` currently extracts PDF/DOCX/TXT/Markdown text, asks the Foundry model for a cited summary, and has an optional read-only Work IQ MCP connection.
-- OneDrive upload and email/Teams sending are not implemented yet.
-- The latest build failed because `AIProjectClient` is unresolved. First try adding the `Azure.AI.Projects` namespace import appropriate to the installed MAF package, then rebuild and address remaining diagnostics before adding more features.
-- Last verified command: `dotnet build DocSummaryAgent.csproj`; dependency-only build succeeded before the `Program.cs` implementation.
+- `Program.cs` loads local settings from `.env` without overriding process environment variables, extracts PDF/DOCX/TXT/Markdown text, asks the Foundry model for a cited summary, supports an optional read-only Work IQ MCP connection, and can copy to OneDrive or send email/Teams messages after per-action confirmation.
+- `AIProjectClient` resolves through the `Azure.AI.Projects` namespace, and the latest build completed without warnings or errors.
+- Last verified commands: `dotnet build DocSummaryAgent.csproj` and `dotnet run --no-build -- --help`.
+
+## Resume Point
+
+- The OneDrive, email, and Teams Graph actions compile; each is opt-in and requires its own explicit confirmation. Teams content is sent as plain text.
+- No OneDrive upload, email, or Teams message has been exercised against a tenant.
+- Next: copy `.env.example` to `.env`, configure the public-client app registration and delegated Graph permissions, then test OneDrive first, email second, and Teams third. Never commit `.env` or send without reviewing and confirming the displayed target and content.
 
 Read this file before continuing work in this project.

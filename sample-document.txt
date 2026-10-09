@@ -1,0 +1,3 @@
+This is a sample document.
+It explains how the summary flow works.
+Use this file when launching from the VS Code Run and Debug menu.
